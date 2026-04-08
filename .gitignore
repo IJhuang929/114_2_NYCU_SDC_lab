@@ -1,0 +1,6 @@
+.vscode/
+*.bag
+*.sh
+__pycache__/
+*.png
+rviz_config/

@@ -1,0 +1,59 @@
+services:
+  ros:
+    image: softmac/sdc-course-docker:latest
+    container_name: ros
+    # runtime: nvidia
+    # network_mode: host  # 使用 host 網路模式，讓容器直接使用主機的網路設定
+    environment:
+      - DISPLAY=${DISPLAY}
+      - QT_X11_NO_MITSHM=1
+      - GRANT_SUDO=yes
+      - NVIDIA_VISIBLE_DEVICES=all
+    volumes:
+      - /tmp/.X11-unix:/tmp/.X11-unix:rw
+      - ~/catkin_ws:/root/catkin_ws
+      - ./lab5:/root/catkin_ws/
+    ports:
+      - "2233:22"
+    user: root
+    stdin_open: true
+    tty: true
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+
+  ros1_dev:
+    build: .
+    container_name: ros1_container
+    network_mode: host  # 使用 host 網路模式，讓容器直接使用主機的網路設定
+    environment:
+      - DISPLAY=${DISPLAY}
+      # - DISPLAY=:1
+      - QT_X11_NO_MITSHM=1
+      - NVIDIA_VISIBLE_DEVICES=all
+    volumes:
+      - /tmp/.X11-unix:/tmp/.X11-unix:rw
+      # Mount ITRI Dataset Directory
+      # Example: /media/ee904/DATA1/Yun/Datasets/ITRI:/ros_ws/data
+      - .:/ros_ws/src/lab2
+      # - ~/.Xauthority:/root/.Xauthority:rw
+    stdin_open: true
+    tty: true
+    # command: >
+    #   bash -c "Xvfb :1 -screen 0 1920x1080x24 &
+    #   sleep 2;
+    #   fluxbox &
+    #   x11vnc -display :1 -passwd sandy10203 -forever -shared -rfbport 5901 &
+    #   source /opt/ros/noetic/setup.bash &&
+    #   bash"
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
