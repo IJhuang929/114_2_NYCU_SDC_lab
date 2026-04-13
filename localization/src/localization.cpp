@@ -59,16 +59,13 @@ int frame_count = 0;
 
 int reject_count = 0;       // 連續 reject 計數
 
-// --- [新增] 恆速模型 (CVM) 所需的歷史位姿 ---
 Eigen::Matrix4f prev_pose = Eigen::Matrix4f::Identity();
-Eigen::Matrix4f prev_prev_pose = Eigen::Matrix4f::Identity();
-int pose_history_count = 0;
 
 // 直線偵測相關
-const int STRAIGHT_HISTORY_SIZE = 10;       // 觀察最近幾幀
+const int STRAIGHT_HISTORY_SIZE = 20;       // 觀察最近幾幀
 std::vector<float> yaw_history;              // 歷史 yaw 值
 bool is_straight_line = false;
-const float STRAIGHT_YAW_THRESHOLD = 0.5;  // 度，N 幀內 yaw 變化量的標準差低於此值判定為直線
+const float STRAIGHT_YAW_THRESHOLD = 0.5;  // N 幀內 yaw 變化量的標準差低於此值判定為直線
 
 // modify IO path
 string t_file = "/root/catkin_ws/src/localization/data/Track1/radar_t_list.txt";
@@ -118,7 +115,7 @@ int main(int argc, char** argv) {
     ndt.setTransformationEpsilon(1e-3);
     ndt.setStepSize(0.1);
     ndt.setResolution(1.0);
-    ndt.setMaximumIterations(80);
+    ndt.setMaximumIterations(100);
 
     ifstream t_in(t_file);
     string line;
@@ -130,7 +127,6 @@ int main(int argc, char** argv) {
         {
             PCL_ERROR ("Couldn't read file\n");
         }
-
 
         callback();
 
@@ -175,27 +171,18 @@ void callback(){
             }
         }
         init_guess = transform_matrix;
-        //  初始化位姿歷史
         prev_pose = transform_matrix;
-        pose_history_count = 1;
         initialized = true;
     }
     else{
-        if (pose_history_count >= 2) {
-            // 計算上上一幀到上一幀的變化矩陣 (速度)
-            Eigen::Matrix4f delta_transform = prev_prev_pose.inverse() * prev_pose;
-            // 將這個變化量套用到上一幀，預測當前幀的 Initial Guess
-            init_guess = prev_pose * delta_transform;
-        } else {
-            init_guess = prev_pose;
-        }
+        init_guess = prev_pose;
     }
 //-------------------------------------------------------------------------------------------------
     
     // dynamic crop map into submap to accelerate scan matching
     float center_x = init_guess(0, 3);
     float center_y = init_guess(1, 3);
-    float square_size = 100.0;      // 400 to 100
+    float square_size = 200.0;      // 400 to 100
 
     float half_size = square_size / 2.0;
     Eigen::Vector4f min_pt(center_x - half_size, center_y - half_size, -std::numeric_limits<float>::max(), 1.0);
@@ -210,7 +197,7 @@ void callback(){
     // Downsample submap to reduce computation
     pcl::VoxelGrid<pcl::PointXYZ> voxel_filter;
     voxel_filter.setInputCloud(submap_pc);
-    voxel_filter.setLeafSize(1.0, 1.0, 1.0);        // 0.5 to 1.0, adjust based on map density and desired accuracy
+    voxel_filter.setLeafSize(0.5, 0.5, 0.5);        // 需小於 NDT resolution(1.0m)，確保每個體素有足夠點數建模
     voxel_filter.filter(*submap_pc);
 
     // Filter radar points by distance: keep 5m ~ 60m range (remove nearby moving objects and far noisy points)
@@ -221,6 +208,12 @@ void callback(){
             radar_pc_filtered->points.push_back(pt);
         }
     }
+
+    // 雷達點雲降採樣：讓不同幀的點密度一致，NDT 品質更穩定
+    pcl::VoxelGrid<pcl::PointXYZ> radar_voxel;
+    radar_voxel.setInputCloud(radar_pc_filtered);
+    radar_voxel.setLeafSize(0.5, 0.5, 0.5);
+    radar_voxel.filter(*radar_pc_filtered);
 
     // Flatten z to 0 for NDT point clouds (force 2D matching)
     // Use copies to preserve original point clouds for RViz display
@@ -264,12 +257,12 @@ void callback(){
     bool moving_backward = (dot < -0.1) && (jump_distance > 0.3);  // 有明顯位移且方向相反
 
     bool accepted = true;
-    if (jump_distance > 3.0 || !ndt.hasConverged() || fabs(dyaw) > 0.2 || ndt_score > 5.0 || moving_backward) {
+    if (jump_distance > 3.0 || !ndt.hasConverged() || fabs(dyaw) > 0.3 || ndt_score > 5.0 || moving_backward) {
         reject_count++;
         // 連續 reject 超過 3 次，強制接受 NDT 結果，避免永遠卡死
         if (reject_count >= 3 && ndt.hasConverged() && !moving_backward) {
             // 強制接受，但限制最大跳躍幅度
-            float clamp_dist = 1.0;  // 最多跳 1m
+            float clamp_dist = 2.0;  // 最多跳 2m
             if (jump_distance > clamp_dist) {
                 float scale = clamp_dist / jump_distance;
                 ndt_result(0, 3) = init_guess(0, 3) + dx * scale;
@@ -292,6 +285,9 @@ void callback(){
             ROS_WARN("Frame rejected (%d): jump=%.2f, score=%.2f, dyaw=%.2f deg, converged=%d, backward=%d",
                      reject_count, jump_distance, ndt_score, dyaw * 180.0 / M_PI, ndt.hasConverged(), moving_backward);
             accepted = false;
+            // reject 時使用上一幀位姿，避免 EMA 把車往回拉
+            transform_matrix = init_guess;
+            transform_matrix(2, 3) = init_guess(2, 3);
         }
     }
     else {
@@ -337,74 +333,105 @@ void callback(){
     }
 
     // --- 自適應 EMA smoothing ---
-    // 分解位移為縱向（沿車頭）和橫向（垂直車頭）
-    float ndt_dx = transform_matrix(0, 3) - init_guess(0, 3);
-    float ndt_dy = transform_matrix(1, 3) - init_guess(1, 3);
-    float heading_cos = cos(prev_yaw);
-    float heading_sin = sin(prev_yaw);
-    float longitudinal = ndt_dx * heading_cos + ndt_dy * heading_sin;   // 沿車頭分量
-    float lateral = -ndt_dx * heading_sin + ndt_dy * heading_cos;       // 垂直車頭分量
+    float alpha_longitudinal = 0.7;     // 縱向預設
+    float alpha_lateral = 0.7;          // 橫向預設
+    float alpha_yaw = 0.7;             // yaw 預設
+    int ndt_iter = (int)ndt.getFinalNumIteration();
+    bool in_warmup = (frame_count < STRAIGHT_HISTORY_SIZE);
 
-    float alpha_longitudinal = 0.7;     // 縱向永遠正常
-    float alpha_lateral = 0.7;          // 橫向預設正常
-    float alpha_yaw = 0.7;             // yaw 預設正常
+    if (accepted) {
+        // === NDT 被接受：做 EMA 平滑 ===
+        // 分解位移為縱向（沿車頭）和橫向（垂直車頭）
+        float ndt_dx = transform_matrix(0, 3) - init_guess(0, 3);
+        float ndt_dy = transform_matrix(1, 3) - init_guess(1, 3);
+        float heading_cos = cos(prev_yaw);
+        float heading_sin = sin(prev_yaw);
+        float longitudinal = ndt_dx * heading_cos + ndt_dy * heading_sin;   // 沿車頭分量
+        float lateral = -ndt_dx * heading_sin + ndt_dy * heading_cos;       // 垂直車頭分量
 
-    if (is_straight_line) {
-        alpha_lateral = 0.15;           // 直線時大幅壓低橫向權重
-        alpha_yaw = 0.15;              // 直線時大幅壓低 yaw 權重
-        // 分數閥值 1.5 和 迭代次數 30 可依據你的 bag log 微調
-        if (ndt_score > 1.5 || ndt.getFinalNumIteration() > 30) {
-            ROS_WARN("Straight line & Poor NDT detected (Score: %.2f). Relying on prediction.", ndt_score);
-            alpha_longitudinal = 0.4;  // 縱向也稍微降低，相信推算
-            alpha_lateral = 0.02;      // 幾乎不採用 NDT 的橫向偏移修正
-            alpha_yaw = 0.02;          // 幾乎不採用 NDT 的旋轉修正
+        // --- 暖機期：歷史不足時用保守 alpha，避免開頭左右晃 ---
+        if (in_warmup) {
+            alpha_lateral = 0.15;
+            alpha_yaw = 0.15;
         }
-        else {
-            // 在彎道或特徵豐富區域，若分數很好，完全信任 NDT
-            if (ndt_score < 0.5) {
+
+        if (is_straight_line) {
+            // === 直線段：預設就壓低橫向和 yaw ===
+            alpha_lateral = 0.15;
+            alpha_yaw = 0.15;
+
+            if (ndt_score > 1.5 || ndt_iter > 30) {
+                // NDT 品質差 → 幾乎完全相信上一幀位姿
+                ROS_WARN("Straight + Poor NDT (score=%.2f, iter=%d) -> rely on prev pose", ndt_score, ndt_iter);
+                alpha_longitudinal = 0.4;
+                alpha_lateral = 0.02;
+                alpha_yaw = 0.02;
+            } else if (ndt_score < 0.5 && ndt_iter < 15) {
+                // NDT 品質極好 → 稍微放寬，但仍比非直線保守
+                alpha_lateral = 0.4;
+                alpha_yaw = 0.4;
+            }
+        } else if (!in_warmup) {
+            // === 非直線段（彎道/特徵豐富區域）===
+            if (ndt_score > 1.5 || ndt_iter > 30) {
+                // NDT 品質差 → 適度壓低
+                alpha_lateral = 0.3;
+                alpha_yaw = 0.3;
+            } else if (ndt_score < 0.5 && ndt_iter < 15) {
+                // NDT 品質極好 → 完全信任
                 alpha_lateral = 0.9;
                 alpha_yaw = 0.9;
+            }
+            // 中間品質維持預設 0.7
         }
-        }
+
+        // 用各自的 alpha 平滑
+        float smooth_longitudinal = alpha_longitudinal * longitudinal;
+        float smooth_lateral = alpha_lateral * lateral;
+
+        // lateral 硬上限：不管 alpha 算出多少，單幀橫向位移最多 0.5m
+        const float MAX_LATERAL_PER_FRAME = 0.5;
+        if (fabs(smooth_lateral) > MAX_LATERAL_PER_FRAME)
+            smooth_lateral = (smooth_lateral > 0 ? 1.0 : -1.0) * MAX_LATERAL_PER_FRAME;
+
+        // 重新組合回 x, y
+        float smooth_x = init_guess(0, 3) + smooth_longitudinal * heading_cos - smooth_lateral * heading_sin;
+        float smooth_y = init_guess(1, 3) + smooth_longitudinal * heading_sin + smooth_lateral * heading_cos;
+
+        // Smooth yaw with angle wrapping
+        float dyaw_smooth = yaw_angle - prev_yaw;
+        while (dyaw_smooth > M_PI) dyaw_smooth -= 2 * M_PI;
+        while (dyaw_smooth < -M_PI) dyaw_smooth += 2 * M_PI;
+        float smooth_yaw = prev_yaw + alpha_yaw * dyaw_smooth;
+
+        transform_matrix(0, 3) = smooth_x;
+        transform_matrix(1, 3) = smooth_y;
+        transform_matrix(0, 0) = cos(smooth_yaw);  transform_matrix(0, 1) = -sin(smooth_yaw); transform_matrix(0, 2) = 0;
+        transform_matrix(1, 0) = sin(smooth_yaw);  transform_matrix(1, 1) =  cos(smooth_yaw); transform_matrix(1, 2) = 0;
+        transform_matrix(2, 0) = 0;                transform_matrix(2, 1) = 0;                transform_matrix(2, 2) = 1;
+    } else {
+        // === NDT 被 reject：直接用上一幀位姿，跳過 EMA ===
+        alpha_longitudinal = 0.0;
+        alpha_lateral = 0.0;
+        alpha_yaw = 0.0;
     }
 
-    // 用各自的 alpha 平滑
-    float smooth_longitudinal = alpha_longitudinal * longitudinal;
-    float smooth_lateral = alpha_lateral * lateral;
 
-    // 重新組合回 x, y
-    float smooth_x = init_guess(0, 3) + smooth_longitudinal * heading_cos - smooth_lateral * heading_sin;
-    float smooth_y = init_guess(1, 3) + smooth_longitudinal * heading_sin + smooth_lateral * heading_cos;
-
-    // Smooth yaw with angle wrapping
-    float dyaw_smooth = yaw_angle - prev_yaw;
-    while (dyaw_smooth > M_PI) dyaw_smooth -= 2 * M_PI;
-    while (dyaw_smooth < -M_PI) dyaw_smooth += 2 * M_PI;
-    float smooth_yaw = prev_yaw + alpha_yaw * dyaw_smooth;
-
-    transform_matrix(0, 3) = smooth_x;
-    transform_matrix(1, 3) = smooth_y;
-    transform_matrix(0, 0) = cos(smooth_yaw);  transform_matrix(0, 1) = -sin(smooth_yaw); transform_matrix(0, 2) = 0;
-    transform_matrix(1, 0) = sin(smooth_yaw);  transform_matrix(1, 1) =  cos(smooth_yaw); transform_matrix(1, 2) = 0;
-    transform_matrix(2, 0) = 0;                transform_matrix(2, 1) = 0;                transform_matrix(2, 2) = 1;
-
-
-    // --- 更新歷史位姿，供下一幀 CVM 預測使用 ---
-    prev_prev_pose = prev_pose;
     prev_pose = transform_matrix;
-    if (pose_history_count < 2) pose_history_count++;
 
     // Debug info
     frame_count++;
     float x = transform_matrix(0, 3);
     float y = transform_matrix(1, 3);
     float yaw = atan2(transform_matrix(1, 0), transform_matrix(0, 0)) * 180.0 / M_PI;
-    ROS_INFO("Frame %d | converged: %d | score: %.4f | iter: %d | x: %.2f y: %.2f yaw: %.1f | radar pts: %lu->%lu | submap pts: %lu",
+    ROS_INFO("Frame %d | %s | score: %.4f | iter: %d | x: %.2f y: %.2f yaw: %.1f | straight: %d warmup: %d | a_lon=%.2f a_lat=%.2f a_yaw=%.2f | pts: %lu->%lu | submap: %lu",
              frame_count,
-             ndt.hasConverged(),
+             accepted ? "OK" : "REJ",
              ndt.getFitnessScore(),
-             (int)ndt.getFinalNumIteration(),
+             ndt_iter,
              x, y, yaw,
+             is_straight_line, in_warmup,
+             alpha_longitudinal, alpha_lateral, alpha_yaw,
              radar_pc->size(),
              radar_pc_filtered->size(),
              submap_pc->size());
