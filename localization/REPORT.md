@@ -238,3 +238,9 @@ python3 processing_codes/eval_score.py result/result_<timestamp>.txt
 # 5. 結果轉 CSV
 python3 processing_codes/txt_to_idx_x_y_yaw.py result/result_<timestamp>.txt result/result.csv
 ```
+
+
+## 4/14
+1. claude 確認code邏輯功能正確
+2. 跑新的 radar point cloud
+3. 實測看看這個版本
