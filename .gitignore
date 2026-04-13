@@ -4,3 +4,10 @@
 __pycache__/
 *.png
 rviz_config/
+*.launch
+data/
+config/
+processing_codes/
+CMakeLists.txt
+package.xml
+result/

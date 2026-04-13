@@ -2,7 +2,7 @@ services:
   ros:
     image: softmac/sdc-course-docker:latest
     container_name: ros
-    # runtime: nvidia
+    runtime: nvidia
     # network_mode: host  # 使用 host 網路模式，讓容器直接使用主機的網路設定
     environment:
       - DISPLAY=${DISPLAY}
@@ -11,8 +11,8 @@ services:
       - NVIDIA_VISIBLE_DEVICES=all
     volumes:
       - /tmp/.X11-unix:/tmp/.X11-unix:rw
-      - ~/catkin_ws:/root/catkin_ws
-      - ./lab5:/root/catkin_ws/
+      # - ~/catkin_ws:/root/catkin_ws
+      - ./localization/:/root/catkin_ws/src/localization
     ports:
       - "2233:22"
     user: root
