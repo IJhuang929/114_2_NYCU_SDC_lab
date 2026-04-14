@@ -205,7 +205,7 @@ void callback(){
     // ====================================================================
     float center_x = init_guess(0, 3);
     float center_y = init_guess(1, 3);
-    float square_size = 100.0;      // 縮小 submap：radar 只看 60m，不需要 100m 半徑
+    float square_size = 100.0;      // 縮小 submap：radar 只看 60m，不需要 200m 半徑
     float half_size = square_size / 2.0;
     Eigen::Vector4f min_pt(center_x - half_size, center_y - half_size, -std::numeric_limits<float>::max(), 1.0);
     Eigen::Vector4f max_pt(center_x + half_size, center_y + half_size, std::numeric_limits<float>::max(), 1.0);
@@ -243,8 +243,8 @@ void callback(){
     // === 雷達點雲基本過濾 ===
     // ====================================================================
     pcl::PointCloud<pcl::PointXYZI>::Ptr radar_pc_filtered(new pcl::PointCloud<pcl::PointXYZI>);
-    // 強度過濾門檻： 3.0 觀察after_filter的點數約 100~200，與 submap 點數差不多，能讓 NDT 有足夠點數配準，但又不會太慢
-    const float INTENSITY_THRESHOLD = 3.0;  // after_filter 太少點就增加
+    // 觀察after_filter的點數約 100~200，與 submap 點數差不多，能讓 NDT 有足夠點數配準，但又不會太慢
+    const float INTENSITY_THRESHOLD = 2.0;  // 3.0 太嚴 after_filter<100，降到 2.0
 
     for (const auto& pt : radar_pc->points) {
         float dist = sqrt(pt.x * pt.x + pt.y * pt.y);
@@ -294,7 +294,7 @@ void callback(){
     pcl::PointCloud<pcl::PointXYZI>::Ptr submap_downsampled(new pcl::PointCloud<pcl::PointXYZI>);
     pcl::VoxelGrid<pcl::PointXYZI> submap_voxel;
     submap_voxel.setInputCloud(submap_pc);
-    submap_voxel.setLeafSize(0.5f, 0.5f, 0.5f);
+    submap_voxel.setLeafSize(1.0f, 1.0f, 1.0f);  // 0.5 -> 1.0: 點數再砍一半，加速 NDT
     submap_voxel.filter(*submap_downsampled);
     ROS_INFO("  Submap: raw=%lu, downsampled=%lu", submap_pc->points.size(), submap_downsampled->points.size());
 
@@ -313,7 +313,7 @@ void callback(){
     // === Coarse-to-Fine NDT 配準 (2D on flattened clouds) ===
     // ====================================================================
     pcl::NormalDistributionsTransform<pcl::PointXYZI, pcl::PointXYZI> ndt;
-    ndt.setTransformationEpsilon(1e-3);
+    ndt.setTransformationEpsilon(1e-2);  // 1e-3 -> 1e-2: score 已 <0.1，提早停止省迭代
     ndt.setStepSize(0.1);
     ndt.setInputTarget(flat_submap);
     ndt.setInputSource(flat_radar);
@@ -322,7 +322,7 @@ void callback(){
     
     // 第一階段：大網格 (Coarse)
     ndt.setResolution(3.0);
-    ndt.setMaximumIterations(25);
+    ndt.setMaximumIterations(15);  // 25 -> 15: coarse 只需粗略對齊
     ndt.align(*aligned_scan, flat_init_guess);
     Eigen::Matrix4f ndt_result = ndt.getFinalTransformation();
 

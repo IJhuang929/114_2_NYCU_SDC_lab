@@ -28,7 +28,7 @@ result/
 # === Misc ===
 *.png
 rviz_config/
-
+*entrypoint.sh
 # === Allow localization package files ===
 !localization/config/
 !localization/config/**
@@ -39,3 +39,4 @@ rviz_config/
 !localization/CMakeLists.txt
 !localization/package.xml
 !localization/REPORT.md
+
