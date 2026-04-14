@@ -1,13 +1,41 @@
+# === IDE / Editor ===
 .vscode/
-*.bag
-*.sh
+.idea/
+
+# === OS ===
+.DS_Store
+Thumbs.db
+
+# === Python ===
 __pycache__/
+*.pyc
+*.pyo
+
+# === ROS build artifacts ===
+build/
+devel/
+install/
+log/
+
+# === Large data files ===
+data/
+*.bag
+*.pcd
+
+# === Results (generated at runtime) ===
+result/
+
+# === Misc ===
 *.png
 rviz_config/
-*.launch
-data/
-config/
-processing_codes/
-CMakeLists.txt
-package.xml
-result/
+
+# === Allow localization package files ===
+!localization/config/
+!localization/config/**
+!localization/launch/
+!localization/launch/**
+!localization/processing_codes/
+!localization/processing_codes/**
+!localization/CMakeLists.txt
+!localization/package.xml
+!localization/REPORT.md

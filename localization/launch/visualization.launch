@@ -1,0 +1,7 @@
+<launch>
+    <arg name="use_rviz" default="true" />
+    <node pkg="map" type="visualization" name="visualization_node" output="screen"/>
+    <node pkg="rviz" type="rviz" name="display_result" output="screen"
+          args="-d /root/catkin_ws/src/localization/config/visualization.rviz"
+          if="$(arg use_rviz)" />
+</launch>

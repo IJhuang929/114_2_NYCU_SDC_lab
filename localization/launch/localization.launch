@@ -1,0 +1,7 @@
+<launch>
+    <arg name="use_rviz" default="true" />
+    <node pkg="rviz" type="rviz" name="display_result" output="screen"
+          args="-d /root/catkin_ws/src/localization/config/localization.rviz"
+          if="$(arg use_rviz)" />
+    <node pkg="localization" type="localization" name="radar_pcd_publisher" output="screen"/>
+</launch>

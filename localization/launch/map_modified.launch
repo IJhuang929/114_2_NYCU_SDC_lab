@@ -1,0 +1,3 @@
+<launch>
+    <node pkg="localization" type="map_modified" name="map_modifier" output="screen"/>
+</launch>
