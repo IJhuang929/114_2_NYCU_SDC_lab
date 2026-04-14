@@ -125,3 +125,6 @@ Run baseline first (no intensity filter, no submap VoxelGrid), then A/B test one
 | 5 | Fine Resolution | 1.0 / 1.5 / 2.0 | score, convergence rate |
 | 6 | Distance max | 40 / 50 / 60 | after_filter count, score |
 | 7 | RadiusOutlierRemoval | r=2.0 minN=2 | noise reduction vs. point loss |
+
+- current param
+||||
