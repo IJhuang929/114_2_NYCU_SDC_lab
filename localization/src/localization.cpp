@@ -55,10 +55,14 @@ pcl::NormalDistributionsTransform<pcl::PointXYZ, pcl::PointXYZ> ndt;
 bool initialized = false;
 Eigen::Matrix4f transform_matrix;
 
+// === CV Model 狀態 ===
+Eigen::Matrix4f prev_pose = Eigen::Matrix4f::Identity();
+bool has_prev = false;
+
 // modify IO path
-string t_file = "/root/catkin_ws/src/localization/data/Track1/radar_t_list.txt";
-string pcd_folder = "/root/catkin_ws/src/localization/data/Track1/stack_3_frame_radar_pcd";
-string map_file = "/root/catkin_ws/src/localization/data/Track1/test.pcd";
+string t_file = "/root/catkin_ws/src/localization/data/Track2/radar_t_list.txt";
+string pcd_folder = "/root/catkin_ws/src/localization/data/Track2/stack_3_frame_radar_pcd";
+string map_file = "/root/catkin_ws/src/localization/data/Track2/test.pcd";
 string save_dir = "/root/catkin_ws/src/localization/result/";
 
 // === radar_front → base_link 靜態外參 ===
@@ -79,7 +83,7 @@ int main(int argc, char** argv) {
     time_t now = time(0);
     tm* t = localtime(&now);
     ostringstream result_fn;
-    result_fn << save_dir << "result_"
+    result_fn << save_dir << "track2_result_"
               << (t->tm_year + 1900)
               << setfill('0') << setw(2) << (t->tm_mon + 1)
               << setw(2) << t->tm_mday << "_"
@@ -98,7 +102,7 @@ int main(int argc, char** argv) {
             << setw(2) << t->tm_min
             << setw(2) << t->tm_sec << ".txt";
     diag_file.open(diag_fn.str());
-    diag_file << "frame,score,x,y,yaw,radar_pts,submap_pts,converged" << endl;
+    diag_file << "frame,score,x,y,yaw,radar_pts,submap_pts,converged,rejected" << endl;
     ROS_INFO("Saving diagnostics to: %s", diag_fn.str().c_str());
 
     tf::TransformBroadcaster br;
@@ -162,22 +166,57 @@ int main(int argc, char** argv) {
 void callback(){
     Eigen::Matrix4f init_guess;
 
-    // Update pose
+    // Update pose with CV Model
     if(!initialized){
-        init_guess << -0.7739014871732518, -0.632632984298013, 0.029188959029395573, -25.31523704528809,
-                      0.632582897383501, -0.7743982245509299, -0.012094120483231403, -4.389283657073975,
-                      0.030255017582620166, 0.009104778446398086, 0.9995007438318981, -7.73,
-                      0.0,      0.0,      0.0,    1.0;
+        //  track1
+        //init_guess << -0.7739014871732518, -0.632632984298013, 0.029188959029395573, -25.31523704528809,
+        //              0.632582897383501, -0.7743982245509299, -0.012094120483231403, -4.389283657073975,
+          //            0.030255017582620166, 0.009104778446398086, 0.9995007438318981, -7.73,
+            //          0.0,      0.0,      0.0,    1.0;
+        //  track2
+            init_guess << -0.9478046334338953, -0.3188028892577441, 0.005576257002181274, 499.4871520996094,
+                           0.3186884878163892, -0.9466153206969891, 0.04854979253344068, -163.97898864746094, 
+                           -0.010199243822116278, 0.047792807227150104, 0.9988051977251651, 7.679019927978516,
+                           0.0,     0.0,     0.0,    1.0;
         initialized = true;
     }
-    else{
+    else if(!has_prev){
+        // 第二幀：還沒有速度資訊，直接用上一幀結果
         init_guess = transform_matrix;
+    }
+    else{
+        // CV Model：外推 x, y, yaw
+        float dx = transform_matrix(0, 3) - prev_pose(0, 3);
+        float dy = transform_matrix(1, 3) - prev_pose(1, 3);
+
+        float curr_yaw = atan2(transform_matrix(1, 0), transform_matrix(0, 0));
+        float prev_yaw = atan2(prev_pose(1, 0), prev_pose(0, 0));
+        float dyaw = curr_yaw - prev_yaw;
+        // 角度歸一化到 [-pi, pi]
+        while (dyaw > M_PI) dyaw -= 2 * M_PI;
+        while (dyaw < -M_PI) dyaw += 2 * M_PI;
+
+        float pred_yaw = curr_yaw + dyaw;
+
+        // 用預測的 yaw 建構 init_guess 的旋轉部分
+        init_guess = Eigen::Matrix4f::Identity();
+        init_guess(0, 0) = cos(pred_yaw);
+        init_guess(0, 1) = -sin(pred_yaw);
+        init_guess(1, 0) = sin(pred_yaw);
+        init_guess(1, 1) = cos(pred_yaw);
+        // z 軸旋轉保持不變（只轉 yaw）
+        init_guess(2, 2) = 1.0;
+
+        // 外推平移
+        init_guess(0, 3) = transform_matrix(0, 3) + dx;
+        init_guess(1, 3) = transform_matrix(1, 3) + dy;
+        init_guess(2, 3) = transform_matrix(2, 3); // z 不外推
     }
 
     // dynamic crop map into submap to accelerate scan matching
     float center_x = init_guess(0, 3);
     float center_y = init_guess(1, 3);
-    float square_size = 400.0;
+    float square_size = 200.0;      //400 to cover more area, 200 for faster speed
 
     float half_size = square_size / 2.0;
     Eigen::Vector4f min_pt(center_x - half_size, center_y - half_size, -std::numeric_limits<float>::max(), 1.0);
@@ -189,6 +228,18 @@ void callback(){
     crop_box_filter.setMax(max_pt);
     crop_box_filter.filter(*submap_pc);
 
+    Eigen::Matrix4f ndt_result;
+    bool rejected = false;
+
+    // === 空 submap 保護 ===
+    if (submap_pc->points.empty()) {
+        ROS_WARN("Frame %d: empty submap! center=(%.1f, %.1f) map_pts=%lu. Using init_guess.",
+                 frame_count + 1, center_x, center_y, map_pc->points.size());
+        rejected = true;
+        // 直接跳到更新 pose，不跑 NDT
+        goto skip_ndt;
+    }
+
     ndt.setInputSource(radar_pc);
     ndt.setInputTarget(submap_pc);
     ndt.setTransformationEpsilon(0.001);
@@ -196,13 +247,59 @@ void callback(){
     ndt.setResolution(2.0);
     ndt.setMaximumIterations(50);
 
+    {
     pcl::PointCloud<pcl::PointXYZ>::Ptr aligned_pc(new pcl::PointCloud<pcl::PointXYZ>);
     ndt.align(*aligned_pc, init_guess);
+    }
 
     if (ndt.hasConverged()) {
-        transform_matrix = ndt.getFinalTransformation();
+        ndt_result = ndt.getFinalTransformation();
+
+        // === 往回走保護：檢查 NDT 結果是否和行進方向相反 ===
+        if (has_prev) {
+            // 前一幀的行進方向
+            float fwd_dx = transform_matrix(0, 3) - prev_pose(0, 3);
+            float fwd_dy = transform_matrix(1, 3) - prev_pose(1, 3);
+            // NDT 結果相對上一幀的位移
+            float ndt_dx = ndt_result(0, 3) - transform_matrix(0, 3);
+            float ndt_dy = ndt_result(1, 3) - transform_matrix(1, 3);
+            // 內積 < 0 代表方向相反（往回走）
+            float dot = fwd_dx * ndt_dx + fwd_dy * ndt_dy;
+            float ndt_dist = sqrt(ndt_dx * ndt_dx + ndt_dy * ndt_dy);
+
+            if (dot < 0 && ndt_dist > 1.0) {
+                // 往回走且位移超過 1m，拒絕此結果
+                ROS_WARN("Frame %d: backward motion rejected (dot=%.2f, dist=%.2f)", frame_count + 1, dot, ndt_dist);
+                rejected = true;
+            }
+        }
+
+        // === 跳躍保護 ===
+        if (!rejected) {
+            float jump_dx = ndt_result(0, 3) - init_guess(0, 3);
+            float jump_dy = ndt_result(1, 3) - init_guess(1, 3);
+            float jump_dist = sqrt(jump_dx * jump_dx + jump_dy * jump_dy);
+            if (jump_dist > 5.0) {
+                ROS_WARN("Frame %d: jump rejected (dist=%.2f)", frame_count + 1, jump_dist);
+                rejected = true;
+            }
+        }
     } else {
         ROS_WARN("NDT did not converge.");
+        rejected = true;
+    }
+
+skip_ndt:
+    // 更新 prev_pose，再更新 transform_matrix
+    // frame_count==0 是第一幀，transform_matrix 尚未被賦值，不能當 prev_pose
+    if (frame_count > 0) {
+        prev_pose = transform_matrix;
+        has_prev = true;
+    }
+
+    if (!rejected) {
+        transform_matrix = ndt_result;
+    } else {
         transform_matrix = init_guess;
     }
 
@@ -213,14 +310,14 @@ void callback(){
     float y = transform_matrix(1, 3);
     float z = transform_matrix(2, 3);
     float yaw = atan2(transform_matrix(1, 0), transform_matrix(0, 0));
-    int converged = ndt.hasConverged() ? 1 : 0;
+    int converged = (!rejected) ? 1 : 0;
 
-    ROS_INFO("Frame %d | Score: %.2f | x: %.2f y: %.2f z: %.2f | yaw: %.3f | radar: %lu submap: %lu",
-             frame_count, score, x, y, z, yaw, radar_pc->points.size(), submap_pc->points.size());
+    ROS_INFO("Frame %d | Score: %.2f | x: %.2f y: %.2f z: %.2f | yaw: %.3f | rejected: %d | radar: %lu submap: %lu",
+             frame_count, score, x, y, z, yaw, rejected ? 1 : 0, radar_pc->points.size(), submap_pc->points.size());
 
     diag_file << frame_count << "," << score << "," << x << "," << y << "," << yaw
               << "," << radar_pc->points.size() << "," << submap_pc->points.size()
-              << "," << converged << endl;
+              << "," << converged << "," << (rejected ? 1 : 0) << endl;
 
     radar_pose_publisher(x, y, z, yaw);
     for (int i = 0; i < 3; ++i) {

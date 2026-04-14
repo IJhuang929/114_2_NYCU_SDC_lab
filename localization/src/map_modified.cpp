@@ -30,7 +30,7 @@ void process_map()
     // Downsample the point cloud using a VoxelGrid filter
     pcl::VoxelGrid<pcl::PointXYZI> voxel_filter;
     voxel_filter.setInputCloud(cloud);
-    voxel_filter.setLeafSize(0.3f, 0.3f, 0.3f); // Adjust leaf size as needed (in meters)
+    voxel_filter.setLeafSize(0.5f, 0.5f, 0.5f); // Adjust leaf size as needed (in meters)
     voxel_filter.filter(*filtered_cloud);
 
 

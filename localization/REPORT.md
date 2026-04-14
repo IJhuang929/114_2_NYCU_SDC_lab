@@ -11,29 +11,24 @@ ROS bag (ARS548 radar) → radar_preprocess.py (疊加3幀, xyz PCD) → localiz
 
 ---
 
-## 核心演算法：Coarse-to-Fine NDT Scan Matching
+## 核心演算法：Single-Pass NDT Scan Matching
 
 NDT 將目標點雲（地圖）劃分為固定大小的體素格子，每個格子內的點分佈以常態分佈建模。透過最佳化源點雲（雷達）在目標分佈上的機率，迭代求解最佳的剛體變換矩陣。
 
-本專案採用 **兩階段 Coarse-to-Fine** 策略，先用大體素快速收斂，再用小體素精修。NDT 輸入為 **Z 軸壓平後的點雲**（radar 和 submap 都設 z=0），讓配準只在 x, y 平面上進行：
-
 ### NDT 參數設定
 
-| 階段       | `resolution` | `maxIterations` | 說明                   |
-| ---------- | ------------ | --------------- | ---------------------- |
-| Coarse     | 3.0 m        | 15              | 大網格，快速粗對齊     |
-| Fine       | 1.0 m        | 20              | 小網格，精修（需 Coarse 收斂才執行） |
-
-| 共用參數                | 值   | 說明               |
+| 參數                    | 值   | 說明               |
 | ----------------------- | ---- | ------------------ |
-| `transformationEpsilon` | 1e-2 | 收斂判斷門檻       |
+| `resolution`            | 2.0 m | NDT 體素格子大小   |
+| `maxIterations`         | 50   | 最大迭代次數       |
+| `transformationEpsilon` | 1e-3 | 收斂判斷門檻       |
 | `stepSize`              | 0.1  | 牛頓法搜索步長     |
 
 ### Point Type
 
 全部管線統一使用 `pcl::PointXYZ`：
 - **Lidar map**：`test.pcd`（預處理後），以 PointXYZ 載入
-- **Radar PCD**：`radar_preprocess.py` 輸出 3 幀疊加的 xyz PCD，以 PointXYZ 載入
+- **Radar PCD**：3 幀疊加的 PCD（含 x y z RangeRate RCS 欄位），以 PointXYZ 載入（只取前 3 欄）
 
 ---
 
@@ -45,9 +40,9 @@ NDT 將目標點雲（地圖）劃分為固定大小的體素格子，每個格�
 
 | 方法      | 參數              | 效果             |
 | --------- | ----------------- | ---------------- |
-| VoxelGrid | leaf size = 0.4 m | 降低點密度       |
+| VoxelGrid | leaf size = 0.5 m | 降低點密度       |
 
-輸出：`test.pcd`（PointXYZ 格式）
+輸出：`test.pcd`（PointXYZI 格式，以 PointXYZ 載入）
 
 ### 2. 雷達點雲預處理（離線，`radar_preprocess.py`）
 
@@ -60,6 +55,8 @@ NDT 將目標點雲（地圖）劃分為固定大小的體素格子，每個格�
 | 單幀點數   | ~350  | 疊加後約 ~1050 點                      |
 
 輸出：`stack_3_frame_radar_pcd/*.pcd`
+
+注意：預處理的 3 幀疊加是 naive concatenation（無 pose compensation），車在高速移動時點雲會模糊。
 
 ### 3. 外參變換（radar_front → base_link）
 
@@ -76,39 +73,55 @@ T_base_to_radar ≈ [[1,  0,  0,  2.022],
 
 每幀載入 PCD 後立刻套用 `T_radar_to_base = T_base_to_radar⁻¹` 轉換。
 
-### 4. 動態 Submap 裁切
+### 4. 動態 Submap 裁切 + 降採樣
 
-以當前估計位置為中心，使用 CropBox 裁切 **200m x 200m** 區域作為 NDT 匹配目標，避免對整張地圖做匹配。包含空 submap 防護：若裁切結果為空，直接使用 init_guess 並跳過該幀。
+以當前估計位置為中心，使用 CropBox 裁切 **200m x 200m** 區域作為 NDT 匹配目標，避免對整張地圖做匹配。裁切後再以 VoxelGrid（leaf size = 0.5m）降採樣，大幅減少 submap 點數加速 NDT。
 
-### 5. Z 軸壓平（2D NDT）
+包含空 submap 防護：若裁切結果為空，直接使用 init_guess 並跳過該幀。
 
-4D 雷達在高度方向的解析度較差，3D NDT 會被 z 軸的噪音干擾。將 radar 和 submap 的 z 座標全部設為 0，init_guess 的 z 也壓平，讓 NDT 只在 x, y 平面上配準。輸出的 z 值固定為 0。
+### 5. Initial Guess 策略：CV Model（恆速模型）
 
-### 6. Initial Guess 策略
+| 情境         | init_guess 來源                        |
+| ------------ | -------------------------------------- |
+| 第一幀       | hardcoded 初始位姿（從 `init_guess.txt` 取得） |
+| 第二幀       | 直接使用第一幀的定位結果               |
+| 第三幀起     | CV Model：用前兩幀的 x, y 位移差外推  |
 
-- **第一幀**：hardcoded 初始位姿（4x4 矩陣），z 設為 0
-- **後續幀**：直接使用上一幀的定位結果作為 init_guess
+CV Model 以加法外推 x, y，z 和旋轉矩陣保持上一幀的值不動，避免 z 軸飄移。
 
-### 7. 發散保護
+```
+dx = transform_matrix.x - prev_pose.x
+dy = transform_matrix.y - prev_pose.y
+init_guess = transform_matrix
+init_guess.x += dx
+init_guess.y += dy
+```
 
-兩個條件任一觸發即拒絕該幀 NDT 結果：
+### 6. 發散保護
 
-| 條件       | 門檻                      | 原因                           |
-| ---------- | ------------------------- | ------------------------------ |
-| 位移跳躍   | > 8.0 m                   | NDT 結果與預測偏差過大         |
-| NDT 未收斂 | `hasConverged() == false` | 結果不可信                     |
+三個條件任一觸發即拒絕該幀 NDT 結果，改用 init_guess：
 
-拒絕時直接使用 `init_guess` 作為當前幀位姿。
+| 條件           | 門檻                      | 原因                           |
+| -------------- | ------------------------- | ------------------------------ |
+| 空 submap      | submap 點數 = 0           | 無法匹配                       |
+| 往回走         | 內積 < 0 且位移 > 1.0 m   | NDT 結果方向與行進方向相反     |
+| 位移跳躍       | > 10.0 m                  | NDT 結果與 init_guess 偏差過大 |
+| NDT 未收斂     | `hasConverged() == false` | 結果不可信                     |
 
-### 8. 診斷記錄
+拒絕時使用 CV Model 預測的 init_guess，讓車繼續往前走。
+
+### 7. 診斷記錄
 
 每幀輸出至 `diag_*.txt`，記錄：
 - `frame`：幀編號
 - `score`：NDT fitness score
-- `jump_distance`：與 init_guess 的位移差
-- `diverged`：是否發散（0/1）
+- `x, y, yaw`：定位結果
+- `radar_pts`：雷達點數
+- `submap_pts`：降採樣後的 submap 點數
+- `converged`：NDT 是否收斂（0/1）
+- `rejected`：是否被拒絕（0/1）
 
-結尾附加總幀數與發散幀數統計。
+結尾附加總幀數統計。
 
 ---
 
@@ -117,7 +130,7 @@ T_base_to_radar ≈ [[1,  0,  0,  2.022],
 ```
 啟動
   |
-  +-- 載入預處理地圖 (test.pcd, PointXYZ)
+  +-- 載入地圖 (test.pcd / map.pcd, PointXYZ)
   +-- 計算 radar_front → base_link 外參 (T_radar_to_base)
   |
   +-- 逐幀迴圈：
@@ -128,20 +141,22 @@ T_base_to_radar ≈ [[1,  0,  0,  2.022],
        |
        (3) 計算 init_guess
        |   +-- 第一幀：hardcoded 初始位姿
-       |   +-- 後續幀：使用上一幀位姿
+       |   +-- 第二幀：使用上一幀結果
+       |   +-- 第三幀起：CV Model (x, y 外推)
        |
        (4) CropBox 裁切 submap (200m x 200m)
-       |   +-- 空 submap → 跳過，使用 init_guess
        |
-       (5) Z 軸壓平 (radar + submap 都設 z=0)
+       (5) Submap VoxelGrid 降採樣 (leaf size = 0.5m)
        |
-       (6) Coarse-to-Fine NDT Scan Matching
-       |   +-- Coarse: resolution=3.0, iter=15
-       |   +-- Fine:   resolution=1.0, iter=20 (需 Coarse 收斂)
+       (6) 空 submap 檢查 → 空則跳過 NDT
        |
-       (7) 發散保護（jump > 8.0m 或未收斂 → 使用 init_guess）
+       (7) NDT Scan Matching (resolution=2.0, iter=50)
        |
-       (8) Z 固定為 0
+       (8) 發散保護
+       |   +-- 往回走 (內積<0 且 dist>1m) → rejected
+       |   +-- 跳躍 (dist>10m) → rejected
+       |   +-- 未收斂 → rejected
+       |   +-- rejected 時使用 init_guess
        |
        (9) 發布 ROS topic + 寫入 result_*.txt + 寫入 diag_*.txt
 ```
@@ -153,7 +168,7 @@ T_base_to_radar ≈ [[1,  0,  0,  2.022],
 | Topic                    | 型別               | 內容               |
 | ------------------------ | ------------------ | ------------------ |
 | `/4D_radar`              | PointCloud2        | 當前雷達點雲       |
-| `/4D_radar_submap_pc`    | PointCloud2        | 裁切後的 lidar submap |
+| `/4D_radar_submap_pc`    | PointCloud2        | 裁切降採樣後的 submap |
 | `/map_pc`                | PointCloud2        | 完整地圖           |
 | `/tranformed_radar_pose` | PoseStamped        | 每幀定位 pose      |
 | `/localization_path`     | nav_msgs/Path      | 累積軌跡           |
@@ -180,16 +195,17 @@ localization/
 |   +-- txt_to_idx_x_y_yaw.py # result.txt → CSV（idx, x, y, yaw）
 |   +-- eval_score.py         # 軌跡平滑度評估（無需 GT）
 +-- data/
-|   +-- Track1/               # 測試軌跡資料
-|       +-- Track1.bag        # 原始 ROS bag
+|   +-- Track1/               # 測試軌跡 1
+|   +-- Track2/               # 測試軌跡 2
+|       +-- *.bag             # 原始 ROS bag
 |       +-- map.pcd           # 原始 lidar 地圖
-|       +-- test.pcd          # 預處理後地圖
-|       +-- init_guess.txt    # 初始位姿
+|       +-- test.pcd          # 預處理後地圖（VoxelGrid 降採樣）
+|       +-- init_guess.txt    # 初始位姿（4x4 矩陣）
 |       +-- radar_t_list.txt  # 雷達時間戳列表
-|       +-- stack_3_frame_radar_pcd/  # 疊加 3 幀的雷達 PCD (xyz)
+|       +-- stack_3_frame_radar_pcd/  # 疊加 3 幀的雷達 PCD
 +-- result/
     +-- result_<timestamp>.txt # 定位輸出（3x4 變換矩陣，每行 12 個數字）
-    +-- diag_<timestamp>.txt   # 診斷記錄（每幀 score, jump_distance, diverged）
+    +-- diag_<timestamp>.txt   # 診斷記錄
 ```
 
 ---
@@ -210,19 +226,21 @@ cd /root/catkin_ws
 ```bash
 python3 src/localization/processing_codes/radar_preprocess.py
 ```
-- 輸入：`data/Track1/Track1.bag`（topic: `/ars548/radar_front/detections`）
-- 輸出：`data/Track1/stack_3_frame_radar_pcd/*.pcd`
+- 輸入：`data/Track*/Track*.bag`（topic: `/ars548/radar_front/detections`）
+- 輸出：`data/Track*/stack_3_frame_radar_pcd/*.pcd`
 
 ### Step 2：地圖預處理（C++，只需跑一次）
 
-對原始 lidar 地圖做 VoxelGrid 降採樣：
+對原始 lidar 地圖做 VoxelGrid 降採樣（leaf size = 0.5m）：
 ```bash
 catkin_make
 source devel/setup.bash
 roslaunch localization map_modified.launch
 ```
-- 輸入：`data/Track1/map.pcd`
-- 輸出：`data/Track1/test.pcd`
+- 輸入：`data/Track*/map.pcd`
+- 輸出：`data/Track*/test.pcd`
+
+注意：需修改 `map_modified.cpp` 中的路徑切換 Track。
 
 ### Step 3：執行定位
 
@@ -234,7 +252,9 @@ roslaunch localization localization.launch
 roslaunch localization localization.launch use_rviz:=false
 ```
 - 輸出：`result/result_<timestamp>.txt` + `result/diag_<timestamp>.txt`
-- 終端會即時顯示每幀 log：`Frame N | Score: x.xx | Jump: x.xx | x: ... y: ... | yaw: ...`
+- 終端即時顯示：`Frame N | Score: x.xx | x: ... y: ... z: ... | yaw: ... | rejected: 0/1`
+
+注意：需修改 `localization.cpp` 中的路徑和 init_guess 切換 Track。
 
 ### Step 4：結果檢視與評估
 
@@ -246,7 +266,7 @@ python3 src/localization/processing_codes/txt_to_idx_x_y_yaw.py \
 # 軌跡平滑度評估（不需要 ground truth）
 python3 src/localization/processing_codes/eval_score.py result/result_<timestamp>.txt
 
-# 查看診斷記錄（每幀 NDT score / jump / 是否發散）
+# 查看診斷記錄
 cat result/diag_<timestamp>.txt
 ```
 
@@ -264,16 +284,6 @@ E_n = sqrt(1/n * Σ||Δp_i||²) + k * sqrt(1/n * Σ||Δθ_i||²)
 - `Δθ`：旋轉誤差（度）
 - `k = 0.2`（旋轉權重）
 
-無 ground truth 時可透過以下指標間接判斷定位品質：
-
-| 觀察指標            | 對應評分項 | 怎麼看                                      |
-| ------------------- | ---------- | -------------------------------------------- |
-| NDT Fitness Score   | Δp         | `diag_*.txt` 中 score 越小越好               |
-| Jump Distance       | Δp         | `diag_*.txt` 中 jump 持續偏大代表不穩定      |
-| 發散次數            | Δp + Δθ   | `diag_*.txt` 最後一行的 diverged_frames      |
-| 幀間位移標準差      | Δp         | `eval_score.py` 的 displacement std 越小越好 |
-| 幀間 yaw 變化       | Δθ         | `eval_score.py` 的 yaw change 突變代表問題   |
-
 ---
 
 ## 可調參數與改善方向
@@ -282,8 +292,8 @@ E_n = sqrt(1/n * Σ||Δp_i||²) + k * sqrt(1/n * Σ||Δθ_i||²)
 
 ### 目前可考慮的改善方向
 
-1. **重新啟用 CV Model**（帶速度 clamp）：高速段 init_guess 偏差太大，NDT 容易掉入局部最小值
-2. **Submap VoxelGrid 降採樣**：submap 點太密，加速 NDT
-3. **重新啟用強度距離補償**：`compensated_intensity = 4*log(R) + log(Pr)`，過濾雜訊點（需搭配 PointXYZI + radar_pcd_with_intensity）
-4. **Frame Stacking in code**：在 localization.cpp 內做多幀疊加（取代 preprocessing 的 3 幀疊加），可動態調整 buffer 大小
+1. **Coarse-to-Fine NDT**：先用大 resolution 粗對齊，再用小 resolution 精修
+2. **Z 軸壓平（2D NDT）**：將 radar 和 submap 的 z 設為 0，減少 z 軸噪音干擾
+3. **強度距離補償**：`compensated_intensity = 4*log(R) + log(Pr)`，過濾雜訊點（需搭配 PointXYZI）
+4. **Frame Stacking with pose compensation**：在 localization.cpp 內做多幀疊加並補償 pose，避免 naive stacking 的模糊問題
 5. **RadiusOutlierRemoval**：去除孤立雜點
