@@ -1,3 +1,7 @@
 <launch>
-    <node pkg="localization" type="map_modified" name="map_modifier" output="screen"/>
+    <arg name="track" default="Track1" />
+
+    <node pkg="localization" type="map_modified" name="map_modifier" output="screen">
+        <rosparam file="$(find localization)/config/params.yaml" command="load" subst_value="true"/>
+    </node>
 </launch>

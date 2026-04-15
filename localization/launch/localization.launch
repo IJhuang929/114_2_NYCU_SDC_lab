@@ -1,7 +1,12 @@
 <launch>
+    <arg name="track" default="Track1" />
     <arg name="use_rviz" default="true" />
+
     <node pkg="rviz" type="rviz" name="display_result" output="screen"
           args="-d /root/catkin_ws/src/localization/config/localization.rviz"
           if="$(arg use_rviz)" />
-    <node pkg="localization" type="localization" name="radar_pcd_publisher" output="screen"/>
+
+    <node pkg="localization" type="localization" name="radar_pcd_publisher" output="screen">
+        <rosparam file="$(find localization)/config/params.yaml" command="load" subst_value="true"/>
+    </node>
 </launch>

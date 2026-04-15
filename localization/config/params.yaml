@@ -1,0 +1,74 @@
+# ========================================
+# Track selection: change this to switch tracks
+# ========================================
+track: "Track1"
+
+# ========================================
+# LiDAR map preprocessor parameters
+# ========================================
+lidar_map_pcd_path: "/root/catkin_ws/src/localization/data/$(arg track)/map.pcd"
+preprocessed_map_save_path: "/root/catkin_ws/src/localization/data/$(arg track)/preprocessed_map.pcd"
+
+# Height filter (original map z median ~ -7.2, range ~ [-26, 13])
+lidar_z_min: -15.0
+lidar_z_max: 5.0
+
+# RANSAC ground removal
+ransac_distance_threshold: 0.2
+
+# Voxel Grid Downsample
+lidar_voxel_size: 0.3
+
+# Statistical Outlier Removal
+sor_mean_k: 30
+sor_std_dev: 1.0
+
+# ========================================
+# Radar preprocessor parameters
+# ========================================
+radar_pcd_folder: "/root/catkin_ws/src/localization/data/$(arg track)/raw_radar_pcd/"
+rcs_min_threshold: -10.0
+radar_z_min: -1.5
+radar_z_max: 3.0
+range_min: 1.5
+range_max: 50.0
+doppler_inlier_threshold: 0.15
+accumulate_frames: 10
+accumulate_voxel_size: 0.3
+T_radar_to_lidar: [0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+
+# ========================================
+# NDT Localization parameters
+# ========================================
+
+# IO paths
+radar_t_list: "/root/catkin_ws/src/localization/data/$(arg track)/radar_t_list.txt"
+preprocessed_radar_pcd_folder: "/root/catkin_ws/src/localization/data/$(arg track)/preprocessed_radar_pcd"
+preprocessed_map_path: "/root/catkin_ws/src/localization/data/$(arg track)/preprocessed_map.pcd"
+ego_velocity_csv: "/root/catkin_ws/src/localization/data/$(arg track)/preprocessed_radar_pcd/ego_velocity.csv"
+result_save_dir: "/root/catkin_ws/src/localization/result/"
+
+# NDT tuning
+ndt_coarse_voxel: 1.5
+ndt_fine_voxel: 1.0
+ndt_max_iterations: 30
+ndt_epsilon: 0.001
+fitness_fail_threshold: 500.0
+max_jump_distance: 5.0
+degenerate_ratio_threshold: 100.0
+pose_smooth_alpha: 0.9
+submap_size: 100.0
+submap_rebuild_dist: 30.0
+coarse_skip_threshold: 10.0
+
+# ========================================
+# init_guess: row-major 3x4 [r00 r01 r02 tx r10 r11 r12 ty r20 r21 r22 tz]
+# ========================================
+# from data/Track1/init_guess.txt (4x4 matrix, row-major 3x4 portion)
+init_guess_track1: [ 0.728890808,  0.683169323, -0.044697496, -255.802342274,
+                    -0.683634565,  0.729797536,  0.006271880, -123.139975819,
+                     0.036904879,  0.025985237,  0.998980879,   -3.331959313]
+# from data/Track2/init_guess.txt
+init_guess_track2: [ 0.699603508, -0.712504332, -0.053782041,  169.701155884,
+                     0.713430858,  0.700720265, -0.002742425,  -28.930335462,
+                     0.039640155, -0.036451157,  0.998548932,    5.084140257]
