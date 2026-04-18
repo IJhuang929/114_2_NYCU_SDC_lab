@@ -27,3 +27,5 @@ target_link_libraries(map_modified ${catkin_LIBRARIES} ${PCL_LIBRARIES} ${OpenCV
 
 add_executable(visualization src/visualization.cpp)
 target_link_libraries(visualization ${catkin_LIBRARIES} ${PCL_LIBRARIES} ${OpenCV_LIBRARIES})
+
+

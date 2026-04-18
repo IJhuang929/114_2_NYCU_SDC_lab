@@ -29,6 +29,7 @@ result/
 *.png
 rviz_config/
 *entrypoint.sh
+CLAUDE.md
 # === Allow localization package files ===
 !localization/config/
 !localization/config/**
@@ -39,4 +40,5 @@ rviz_config/
 !localization/CMakeLists.txt
 !localization/package.xml
 !localization/REPORT.md
+!result1.png
 

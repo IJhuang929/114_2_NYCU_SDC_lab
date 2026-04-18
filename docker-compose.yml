@@ -12,7 +12,8 @@ services:
     volumes:
       - /tmp/.X11-unix:/tmp/.X11-unix:rw
       # - ~/catkin_ws:/root/catkin_ws
-      - ./localization/:/root/catkin_ws/src/localization
+      - ./lab5/src/fusion:/root/catkin_ws/src/fusion
+      - ./lab5/data:/root/catkin_ws/data
     ports:
       - "2233:22"
     user: root

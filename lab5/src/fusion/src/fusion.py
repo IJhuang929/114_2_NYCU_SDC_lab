@@ -7,6 +7,8 @@ from tf.transformations import euler_from_quaternion, quaternion_from_euler
 from geometry_msgs.msg import PoseWithCovarianceStamped as Pose
 from nav_msgs.msg import Odometry
 from math import cos, sin, atan2, sqrt
+import matplotlib
+matplotlib.use('Agg')
 from matplotlib import pyplot as plt
 
 from EKF import ExtendedKalmanFilter
@@ -79,27 +81,28 @@ class Fusion:
         #     Calculate transformation matrix between 2 odometry data
         #         -> transformation = last_odom_pose^-1 * current_odom_pose
         #     etc.
-        # 計算在局部座標系下的增量 (u)
-        prev_x, prev_y, prev_yaw = self.last_odom
-        dx_global = odom_x - prev_x
-        dy_global = odom_y - prev_y
-        
-        # 轉回局部座標 (旋轉矩陣的逆)
-        dx_local = dx_global * cos(prev_yaw) + dy_global * sin(prev_yaw)
-        dy_local = -dx_global * sin(prev_yaw) + dy_global * cos(prev_yaw)
-        d_yaw = odom_yaw - prev_yaw
-        
-        control = [dx_local, dy_local, d_yaw]
-        
         if not self.initial:
             self.EKF = ExtendedKalmanFilter(odom_x, odom_y, odom_yaw)
             self.last_odom = (odom_x, odom_y, odom_yaw)
             self.initial = True
 
         else:
-            # Update error covriance
-            self.EKF.R = np.array(data.pose.covariance).reshape(6,6)[:3,:3]
-            self.EKF.predict_EKF(u = control)
+            # Local-frame increment between last and current odom (global-frame poses)
+            prev_x, prev_y, prev_yaw = self.last_odom
+            dx_global = odom_x - prev_x
+            dy_global = odom_y - prev_y
+            dx_local =  dx_global * cos(prev_yaw) + dy_global * sin(prev_yaw)
+            dy_local = -dx_global * sin(prev_yaw) + dy_global * cos(prev_yaw)
+            d_yaw = atan2(sin(odom_yaw - prev_yaw), cos(odom_yaw - prev_yaw))
+
+            control = [dx_local, dy_local, d_yaw]
+
+            # Step-wise process noise: scale with motion so GPS retains influence
+            dist = sqrt(dx_local * dx_local + dy_local * dy_local)
+            sigma_xy = 0.05 + 0.05 * dist
+            sigma_yaw = 0.5 * 3.14159265 / 180.0
+            self.EKF.R = np.diag([sigma_xy ** 2, sigma_xy ** 2, sigma_yaw ** 2])
+            self.EKF.predict(u = control)
             
         self.last_odom = (odom_x, odom_y, odom_yaw)
         self.predictPublish()
@@ -134,6 +137,14 @@ class Fusion:
         return
 
     def plot_path(self):
+        gt = np.array(self.gt_list)
+        est = np.array(self.est_list)
+        n = min(gt.shape[1], est.shape[1])
+        if n > 0:
+            err = np.linalg.norm(gt[:, :n] - est[:, :n], axis=0)
+            rmse = float(np.sqrt((err ** 2).mean()))
+            print(f"[EKF] samples={n}  RMSE={rmse:.3f} m  max={err.max():.3f} m")
+
         plt.figure(figsize=(10, 8))
         plt.xlabel('x')
         plt.ylabel('y')
@@ -145,8 +156,7 @@ class Fusion:
         if not os.path.exists("/root/catkin_ws/result"):
             print("not exist")
             os.mkdir("/root/catkin_ws/result")
-        plt.savefig("/root/catkin_ws/result/result.png")
-        plt.show()
+        plt.savefig("/root/catkin_ws/result/result2.png")
         return
     
 if __name__ == '__main__':

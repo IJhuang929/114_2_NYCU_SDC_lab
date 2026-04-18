@@ -1,322 +1,384 @@
 #!/usr/bin/env python3
 """
-Radar Preprocessor (CLI mode)
+Radar preprocessor + IMU extractor.
 
 Usage:
-    python3 radar_preprocessor.py <params.yaml>
+    python3 radar_preprocessor.py params.yaml              # radar PCD only
+    python3 radar_preprocessor.py params.yaml --extract-imu # radar PCD + IMU aligned txt
+    python3 radar_preprocessor.py params.yaml --imu-only    # IMU only (skip radar PCD)
 
-Reads radar PCD files from the folder specified in params.yaml,
-applies filtering / ego-velocity RANSAC / multi-frame accumulation,
-and saves per-frame accumulated PCD files + ego_velocity.csv.
+Reads all paths and parameters from params.yaml.
 """
 import os
 import sys
 import glob
 import yaml
-import csv
 import numpy as np
 from collections import deque
+from math import atan2, asin, pi
+from bisect import bisect_left
+import open3d as o3d
+import numpy as np
 
+try:
+    from scipy.spatial import KDTree
+except ImportError:
+    KDTree = None
+    print("[WARN] scipy not found, SOR filter will be skipped")
+
+# ============================================================
+#  Point cloud filters
+# ============================================================
+
+def range_filter(points, r_min, r_max):
+    """距離過濾"""
+    dists = np.linalg.norm(points[:, :3], axis=1)
+    mask = (dists >= r_min) & (dists <= r_max)
+    return points[mask]
+
+def pass_through_filter(points, z_min, z_max):
+    """Z 範圍過濾"""
+    mask = (points[:, 2] >= z_min) & (points[:, 2] <= z_max)
+    return points[mask]
+
+def statistical_outlier_removal(points, mean_k=10, std_dev_mul=2):
+    """統計離群值移除 (SOR)"""
+    if KDTree is None or len(points) < mean_k:
+        return points
+    tree = KDTree(points[:, :3])
+    dists, _ = tree.query(points[:, :3], k=mean_k + 1)
+    avg_dists = np.mean(dists[:, 1:], axis=1)
+    threshold = np.mean(avg_dists) + std_dev_mul * np.std(avg_dists)
+    return points[avg_dists < threshold]
+
+def voxel_grid_filter(points, leaf_size):
+    """體素下採樣"""
+    if len(points) == 0 or leaf_size <= 0:
+        return points
+    idx = np.floor(points[:, :3] / leaf_size).astype(np.int64)
+    keys = idx[:, 0] * 1000003 + idx[:, 1] * 1009 + idx[:, 2]
+    _, indices = np.unique(keys, return_index=True)
+    return points[indices]
+
+def intensity_range_compensation(points):
+    """
+    雷達強度距離補償 (Intensity Range Compensation)
+    Pn = log(R^4 * Pr) = 4*log(R) + log(Pr)
+
+    Input:  (N, 4) -> [x, y, z, rcs_dB]
+    Output: (N, 4) -> [x, y, z, compensated_intensity]
+
+    R  = sqrt(x^2 + y^2 + z^2)  (距離)
+    Pr = 10^(rcs_dB / 10)        (dB 轉線性功率)
+    """
+    if len(points) == 0:
+        return points
+    xyz = points[:, :3]
+    rcs = points[:, 3]
+    R = np.maximum(np.linalg.norm(xyz, axis=1), 0.1)
+    Pr = np.maximum(np.power(10.0, rcs / 10.0), 1e-6)
+    Pn = 4.0 * np.log(R) + np.log(Pr)
+    result = points.copy()
+    result[:, 3] = Pn
+    return result
 
 # ============================================================
 #  PCD I/O
 # ============================================================
+
 def read_pcd(filepath):
-    """Read ASCII PCD file, return Nx5 array [x, y, z, RangeRate, RCS]."""
     with open(filepath, 'r') as f:
         lines = f.readlines()
+    data_idx = next(i for i, l in enumerate(lines) if l.startswith('DATA')) + 1
+    rows = [line.strip().split() for line in lines[data_idx:] if line.strip()]
+    if not rows:
+        return np.empty((0, 4))
+    arr = np.array(rows, dtype=np.float32)
+    if arr.shape[1] >= 5:
+        return arr[:, [0, 1, 2, 4]]   # x, y, z, rcs (skip range col)
+    elif arr.shape[1] >= 4:
+        return arr[:, :4]              # x, y, z, intensity
+    else:
+        return np.column_stack([arr[:, :3], np.zeros(len(arr))])  # xyz only
 
-    data_idx = 0
-    for i, line in enumerate(lines):
-        if line.strip().startswith('DATA'):
-            data_idx = i + 1
-            break
-
-    points = []
-    for line in lines[data_idx:]:
-        vals = line.strip().split()
-        if len(vals) >= 5:
-            points.append([float(v) for v in vals[:5]])
-
-    if len(points) == 0:
-        return np.empty((0, 5))
-    return np.array(points)
-
-
-def write_pcd_xyzi(filepath, points):
-    """
-    Write ASCII PCD with fields: x y z intensity
-    points: Nx4 [x, y, z, intensity(rcs)]
-    """
+def write_pcd(filepath, points):
     n = len(points)
     header = (
-        "# .PCD v0.7 - Point Cloud Data file format\n"
-        "VERSION 0.7\n"
-        "FIELDS x y z intensity\n"
-        "SIZE 4 4 4 4\n"
-        "TYPE F F F F\n"
-        "COUNT 1 1 1 1\n"
-        f"WIDTH {n}\n"
-        "HEIGHT 1\n"
-        "VIEWPOINT 0 0 0 1 0 0 0\n"
-        f"POINTS {n}\n"
-        "DATA ascii\n"
+        f"# .PCD v0.7\nVERSION 0.7\nFIELDS x y z intensity\nSIZE 4 4 4 4\n"
+        f"TYPE F F F F\nCOUNT 1 1 1 1\nWIDTH {n}\nHEIGHT 1\nPOINTS {n}\nDATA ascii\n"
     )
     with open(filepath, 'w') as f:
         f.write(header)
         np.savetxt(f, points, fmt="%.6f")
 
+# ============================================================
+#  IMU utilities
+# ============================================================
+
+def normalize_angle(angle):
+    while angle > pi:
+        angle -= 2.0 * pi
+    while angle < -pi:
+        angle += 2.0 * pi
+    return angle
+
+def quaternion_to_rpy(x, y, z, w):
+    sinr_cosp = 2.0 * (w * x + y * z)
+    cosr_cosp = 1.0 - 2.0 * (x * x + y * y)
+    roll = atan2(sinr_cosp, cosr_cosp)
+
+    sinp = 2.0 * (w * y - z * x)
+    pitch = np.sign(sinp) * (pi / 2.0) if abs(sinp) >= 1 else asin(sinp)
+
+    siny_cosp = 2.0 * (w * z + x * y)
+    cosy_cosp = 1.0 - 2.0 * (y * y + z * z)
+    yaw = atan2(siny_cosp, cosy_cosp)
+    return roll, pitch, yaw
+
+def find_closest_index(sorted_list, target):
+    pos = bisect_left(sorted_list, target)
+    if pos == 0:
+        return 0
+    if pos == len(sorted_list):
+        return len(sorted_list) - 1
+    before = sorted_list[pos - 1]
+    after = sorted_list[pos]
+    return pos if abs(after - target) < abs(target - before) else pos - 1
+
+def detect_imu_topic(bag):
+    """Auto-detect the first sensor_msgs/Imu topic in the bag."""
+    topic_info = bag.get_type_and_topic_info().topics
+    candidates = [name for name, info in topic_info.items()
+                  if info.msg_type == "sensor_msgs/Imu"]
+    if not candidates:
+        return None
+    for keyword in ["/imu/data", "/imu", "imu/data", "imu"]:
+        for c in candidates:
+            if keyword in c:
+                return c
+    return candidates[0]
+
+def extract_imu_table(bag, imu_topic):
+    """
+    Extract full-rate IMU data from the bag.
+    Returns list of dicts: {t_ns, roll, pitch, yaw, ax, ay, source}
+    Handles both orientation-based and gyro-integration fallback.
+    ax, ay = body-frame linear acceleration (from sensor_msgs/Imu).
+    """
+    imu_table = []
+    prev_t = None
+    integrated_yaw = 0.0
+    prev_orientation_yaw = None
+
+    for _, msg, _ in bag.read_messages(topics=[imu_topic]):
+        t_ns = msg.header.stamp.to_nsec()
+        qx, qy, qz, qw = (msg.orientation.x, msg.orientation.y,
+                            msg.orientation.z, msg.orientation.w)
+
+        # Body-frame linear acceleration (always available)
+        ax = msg.linear_acceleration.x
+        ay = msg.linear_acceleration.y
+
+        has_valid_orientation = not (
+            abs(qx) < 1e-12 and abs(qy) < 1e-12 and
+            abs(qz) < 1e-12 and abs(qw) < 1e-12
+        )
+
+        if has_valid_orientation:
+            roll, pitch, yaw = quaternion_to_rpy(qx, qy, qz, qw)
+            # Unwrap yaw to avoid +-pi jumps
+            if prev_orientation_yaw is not None:
+                dyaw = normalize_angle(yaw - prev_orientation_yaw)
+                yaw = imu_table[-1]["yaw"] + dyaw if imu_table else yaw
+            prev_orientation_yaw = quaternion_to_rpy(qx, qy, qz, qw)[2]
+            imu_table.append({"t_ns": t_ns, "roll": roll, "pitch": pitch,
+                              "yaw": yaw, "ax": ax, "ay": ay,
+                              "source": "orientation"})
+        else:
+            # Fallback: integrate gyro z
+            dt = 0.0 if prev_t is None else (t_ns - prev_t) * 1e-9
+            wz = msg.angular_velocity.z
+            integrated_yaw = normalize_angle(integrated_yaw + wz * dt)
+            imu_table.append({"t_ns": t_ns, "roll": 0.0, "pitch": 0.0,
+                              "yaw": integrated_yaw, "ax": ax, "ay": ay,
+                              "source": "gyro_integrated"})
+
+        prev_t = t_ns
+
+    return imu_table
+
+def build_imu_aligned_txt(radar_timestamps_ns, imu_table, output_txt):
+    """
+    For each radar timestamp, find the nearest IMU sample and compute delta_yaw.
+    Output format (space-separated):
+        timestamp roll pitch yaw delta_yaw ax ay source
+    ax, ay are body-frame linear acceleration from IMU.
+    """
+    if not imu_table:
+        raise RuntimeError("IMU table is empty!")
+
+    imu_times = [d["t_ns"] for d in imu_table]
+    prev_yaw = None
+
+    with open(output_txt, "w") as f:
+        f.write("timestamp roll pitch yaw delta_yaw ax ay source\n")
+        for radar_t_ns in radar_timestamps_ns:
+            idx = find_closest_index(imu_times, radar_t_ns)
+            d = imu_table[idx]
+            yaw = d["yaw"]
+            delta_yaw = 0.0 if prev_yaw is None else normalize_angle(yaw - prev_yaw)
+            prev_yaw = yaw
+            f.write(f"{radar_t_ns} {d['roll']:.9f} {d['pitch']:.9f} "
+                    f"{yaw:.9f} {delta_yaw:.9f} "
+                    f"{d['ax']:.9f} {d['ay']:.9f} {d['source']}\n")
+
+    print(f"[OK] imu_aligned.txt saved: {output_txt}  ({len(radar_timestamps_ns)} entries)")
 
 # ============================================================
-#  Step 1: Single-frame filtering
+#  Main pipeline
 # ============================================================
-def filter_single_frame(points, rcs_min, z_min, z_max, range_min, range_max):
-    """
-    points: Nx5 [x, y, z, RangeRate, RCS]
-    Returns filtered Nx5.
-    """
-    if len(points) == 0:
-        return points
 
-    x, y, z = points[:, 0], points[:, 1], points[:, 2]
-    rcs = points[:, 4]
-    ranges = np.sqrt(x**2 + y**2 + z**2)
-
-    mask = (
-        (rcs > rcs_min) &
-        (z > z_min) & (z < z_max) &
-        (ranges > range_min) & (ranges < range_max)
-    )
-    return points[mask]
+def resolve(params, key, track):
+    """Resolve a params.yaml value, replacing $(arg track)."""
+    val = params.get(key, "")
+    return val.replace("$(arg track)", track) if val else ""
 
 
-# ============================================================
-#  Step 2: Ego velocity estimation (RANSAC)
-# ============================================================
-def estimate_ego_velocity(points, doppler_threshold, n_iter=200, n_sample=3):
-    """
-    RANSAC estimation of ego velocity from radar doppler.
-    points: Nx5 [x, y, z, RangeRate, RCS]
-    Returns: v_ego (3,), inlier_mask (N,)
-    """
-    if len(points) < n_sample:
-        return np.zeros(3), np.ones(len(points), dtype=bool)
 
-    x, y, z = points[:, 0], points[:, 1], points[:, 2]
-    doppler = points[:, 3]
+def process_radar_pcd(params, track):
+    """Stage 1: filter + stack + SOR + voxel on raw radar PCD files."""
+    raw_folder = resolve(params, 'radar_pcd_folder', track)
+    output_dir = resolve(params, 'preprocessed_radar_pcd_folder', track)
 
-    # Azimuth and elevation
-    az = np.arctan2(y, x)
-    r_xy = np.sqrt(x**2 + y**2)
-    el = np.arctan2(z, r_xy)
+    z_min       = float(params.get('radar_z_min', -10.0))
+    z_max       = float(params.get('radar_z_max', 30.0))
+    r_min       = float(params.get('range_min', 1.5))
+    r_max       = float(params.get('range_max', 70.0))
+    n_frames    = int(params.get('accumulate_frames', 3))
+    v_size      = float(params.get('accumulate_voxel_size', 0.5))
+    mean_k      = int(params.get('radar_sol_mean_k', 20))
+    std_dev_mul = float(params.get('radar_sol_std_dev_mul', 1.5))
+    rcs_min          = float(params.get('radar_rcs_min', 2.0))       
 
-    # Direction matrix: v_r = -D @ v_ego
-    cos_az, sin_az = np.cos(az), np.sin(az)
-    cos_el, sin_el = np.cos(el), np.sin(el)
-    D = np.column_stack([cos_az * cos_el, sin_az * cos_el, sin_el])
+    os.makedirs(output_dir, exist_ok=True)
+    pcd_files = sorted(glob.glob(os.path.join(raw_folder, '*.pcd')))
+    frame_buffer = deque(maxlen=n_frames)
 
-    best_inliers = 0
-    best_v_ego = np.zeros(3)
-    best_mask = np.zeros(len(points), dtype=bool)
+    print(f"--- Radar PCD preprocessing ({track}) - [No Doppler Mode] ---")
+    print(f"    Z[{z_min}~{z_max}], Range[{r_min}~{r_max}], Voxel: {v_size}")
+    print(f"    Filtering: RCS_min={rcs_min} (Used to suppress ghosts)")
+    for pcd_path in pcd_files:
+        basename = os.path.basename(pcd_path)
+        
+        # 這裡假設你的 read_pcd 讀取後包含 'x','y','z','intensity' 欄位
+        points = read_pcd(pcd_path) 
+        if len(points) == 0:
+            continue
+        
+        # 1. RCS Filter: 移除強度過低的點 (Ghost points/Noise)
+        if 'intensity' in points.dtype.names:
+            points = points[points['intensity'] > rcs_min]
 
-    N = len(points)
-    for _ in range(n_iter):
-        idx = np.random.choice(N, n_sample, replace=False)
-        D_s = D[idx]
-        doppler_s = doppler[idx]
-
-        try:
-            v_ego, _, _, _ = np.linalg.lstsq(D_s, -doppler_s, rcond=None)
-        except np.linalg.LinAlgError:
+        if len(points) == 0:
             continue
 
-        doppler_pred = -D @ v_ego
-        residual = np.abs(doppler - doppler_pred)
-        inlier_mask = residual < doppler_threshold
+        # 強度距離補償: Pn = 4*log(R) + log(Pr)
+        points = intensity_range_compensation(points)
 
-        n_inliers = np.sum(inlier_mask)
-        if n_inliers > best_inliers:
-            best_inliers = n_inliers
-            best_mask = inlier_mask
-            best_v_ego = v_ego
+        # 空間過濾
+        points = pass_through_filter(points, z_min, z_max)
+        points = range_filter(points, r_min, r_max)
 
-    # Refit with all inliers
-    if best_inliers >= n_sample:
-        D_in = D[best_mask]
-        doppler_in = doppler[best_mask]
-        try:
-            best_v_ego, _, _, _ = np.linalg.lstsq(D_in, -doppler_in, rcond=None)
-        except np.linalg.LinAlgError:
-            pass
+        # 提取 XYZ 用於後續堆疊與 PCL 過濾
+        # 注意：如果 read_pcd 回傳的是自定義結構，這裡需要提取 XYZ
+        xyz = np.vstack((points['x'], points['y'], points['z'])).T
 
-    return best_v_ego, best_mask
+        frame_buffer.append(xyz)
+        stacked = np.vstack(list(frame_buffer))
 
+        # PCL 風格的過濾
+        filtered = statistical_outlier_removal(stacked, mean_k, std_dev_mul)
+        final = voxel_grid_filter(filtered, v_size)
 
-# ============================================================
-#  Step 3: Multi-frame accumulation with ego-motion compensation
-# ============================================================
-def accumulate_frames(frame_buffer, voxel_size):
-    """
-    frame_buffer: list of (points_xyz_rcs Nx4, dt_to_latest, v_ego (3,))
-    Compensate each old frame to latest frame coordinate, merge, voxel downsample.
-    Returns Nx4 [x, y, z, rcs].
-    """
-    if len(frame_buffer) == 0:
-        return np.empty((0, 4))
+        write_pcd(os.path.join(output_dir, basename), final)
 
-    all_points = []
-    for pts, dt, v_ego in frame_buffer:
-        if len(pts) == 0:
-            continue
-        compensated = pts.copy()
-        compensated[:, 0] += v_ego[0] * dt
-        compensated[:, 1] += v_ego[1] * dt
-        compensated[:, 2] += v_ego[2] * dt
-        all_points.append(compensated)
-
-    if len(all_points) == 0:
-        return np.empty((0, 4))
-
-    merged = np.vstack(all_points)
-    return voxel_downsample(merged, voxel_size)
+    print(f"[OK] Radar PCD done -> {output_dir}")
 
 
-def voxel_downsample(points, voxel_size):
-    """
-    Voxel grid downsample for Nx4 [x, y, z, rcs].
-    Within each voxel, average xyz and rcs.
-    """
-    if len(points) == 0 or voxel_size <= 0:
-        return points
-
-    voxel_idx = np.floor(points[:, :3] / voxel_size).astype(np.int64)
-
-    # Hash-based grouping
-    keys = voxel_idx[:, 0] * 1000003 + voxel_idx[:, 1] * 1009 + voxel_idx[:, 2]
-    unique_keys, inverse = np.unique(keys, return_inverse=True)
-
-    result = np.zeros((len(unique_keys), 4))
-    counts = np.zeros(len(unique_keys))
-    np.add.at(result, inverse, points)
-    np.add.at(counts, inverse, 1)
-    result /= counts[:, np.newaxis]
-
-    return result
 
 
-# ============================================================
-#  Main
-# ============================================================
+
+
+def extract_imu(params, track):
+    """Stage 2: open the rosbag, extract IMU, align to radar timestamps."""
+    import rosbag  # only import when needed (requires ROS environment)
+
+    bag_path    = resolve(params, 'bag_path', track)
+    t_list_path = resolve(params, 'radar_t_list', track)
+    imu_out     = resolve(params, 'imu_aligned_path', track)
+
+    # Validate inputs
+    if not bag_path or not os.path.isfile(bag_path):
+        print(f"[ERROR] bag file not found: {bag_path}")
+        return
+    if not t_list_path or not os.path.isfile(t_list_path):
+        print(f"[ERROR] radar_t_list not found: {t_list_path}")
+        return
+
+    # Read radar timestamps from radar_t_list.txt
+    with open(t_list_path, 'r') as f:
+        radar_timestamps_ns = [int(line.strip()) for line in f if line.strip()]
+    print(f"[INFO] Radar timestamps: {len(radar_timestamps_ns)} frames from {t_list_path}")
+
+    # Open bag and detect IMU topic
+    print(f"[INFO] Opening bag: {bag_path}")
+    bag = rosbag.Bag(bag_path)
+
+    imu_topic = detect_imu_topic(bag)
+    if imu_topic is None:
+        bag.close()
+        print("[ERROR] No sensor_msgs/Imu topic found in bag!")
+        return
+    print(f"[INFO] Detected IMU topic: {imu_topic}")
+
+    # Extract high-rate IMU table
+    imu_table = extract_imu_table(bag, imu_topic)
+    print(f"[INFO] IMU messages extracted: {len(imu_table)}")
+    bag.close()
+
+    if not imu_table:
+        print("[ERROR] IMU table is empty, cannot produce imu_aligned.txt")
+        return
+
+    # Align to radar timestamps and save
+    os.makedirs(os.path.dirname(imu_out) or ".", exist_ok=True)
+    build_imu_aligned_txt(radar_timestamps_ns, imu_table, imu_out)
+
 def main():
     if len(sys.argv) < 2:
-        print(f"Usage: python3 {sys.argv[0]} <params.yaml>")
-        sys.exit(1)
+        print("Usage: python3 radar_preprocessor.py params.yaml [--extract-imu] [--imu-only]")
+        print()
+        print("  (default)        Radar PCD preprocessing only")
+        print("  --extract-imu    Radar PCD + extract IMU from bag -> imu_aligned.txt")
+        print("  --imu-only       Only extract IMU (skip radar PCD preprocessing)")
+        return
 
-    # --- Load params ---
     with open(sys.argv[1], 'r') as f:
         params = yaml.safe_load(f)
 
-    # Resolve $(arg track) substitution (ROS launch syntax not available in CLI)
-    track = params.get('track', 'Track1')
-    for key, val in params.items():
-        if isinstance(val, str) and '$(arg track)' in val:
-            params[key] = val.replace('$(arg track)', track)
+    track    = params.get('track', 'Track1')
+    do_imu   = '--extract-imu' in sys.argv
+    imu_only = '--imu-only' in sys.argv
 
-    radar_pcd_folder  = params.get('radar_pcd_folder',
-                        '/root/catkin_ws/src/localization/data/Track1/raw_radar_pcd/')
-    rcs_min           = float(params.get('rcs_min_threshold', -10.0))
-    z_min             = float(params.get('radar_z_min', -1.5))
-    z_max             = float(params.get('radar_z_max', 3.0))
-    range_min         = float(params.get('range_min', 1.5))
-    range_max         = float(params.get('range_max', 80.0))
-    doppler_threshold = float(params.get('doppler_inlier_threshold', 0.15))
-    n_accumulate      = int(params.get('accumulate_frames', 10))
-    voxel_size        = float(params.get('accumulate_voxel_size', 0.3))
+    # Stage 1: Radar PCD preprocessing
+    if not imu_only:
+        process_radar_pcd(params, track)
 
-    # Output folder: next to input folder
-    output_dir = os.path.join(os.path.dirname(radar_pcd_folder.rstrip('/')),
-                              'preprocessed_radar_pcd')
-    os.makedirs(output_dir, exist_ok=True)
-
-    # --- Load all PCD files sorted by timestamp ---
-    pcd_files = sorted(glob.glob(os.path.join(radar_pcd_folder, '*.pcd')))
-    if len(pcd_files) == 0:
-        print(f"[ERROR] No PCD files found in {radar_pcd_folder}")
-        sys.exit(1)
-
-    print(f"Found {len(pcd_files)} radar PCD files in {radar_pcd_folder}")
-    print(f"Output dir: {output_dir}")
-
-    # Sliding window: (points_xyz_rcs, dt, v_ego, timestamp_sec)
-    frame_buffer = deque(maxlen=n_accumulate)
-
-    # Ego velocity log
-    ego_vel_csv_path = os.path.join(output_dir, 'ego_velocity.csv')
-    ego_vel_file = open(ego_vel_csv_path, 'w', newline='')
-    ego_vel_writer = csv.writer(ego_vel_file)
-    ego_vel_writer.writerow(['timestamp_nsec', 'vx', 'vy', 'vz'])
-
-    for i, pcd_path in enumerate(pcd_files):
-        basename = os.path.splitext(os.path.basename(pcd_path))[0]
-        try:
-            ts_nsec = int(basename)
-        except ValueError:
-            print(f"  [WARN] Skipping non-timestamp file: {basename}")
-            continue
-
-        current_ts_sec = ts_nsec / 1e9
-
-        # --- Read PCD ---
-        raw_points = read_pcd(pcd_path)
-        if len(raw_points) == 0:
-            continue
-
-        # --- Step 1: Single-frame filtering ---
-        filtered = filter_single_frame(raw_points, rcs_min, z_min, z_max,
-                                       range_min, range_max)
-
-        # --- Step 2: Ego velocity RANSAC ---
-        v_ego, inlier_mask = estimate_ego_velocity(filtered, doppler_threshold)
-        static_points = filtered[inlier_mask]
-
-        # Log ego velocity
-        ego_vel_writer.writerow([basename, f"{v_ego[0]:.6f}",
-                                 f"{v_ego[1]:.6f}", f"{v_ego[2]:.6f}"])
-
-        print(f"  [{i+1:4d}/{len(pcd_files)}] raw={len(raw_points):4d}  "
-              f"filtered={len(filtered):4d}  static={len(static_points):4d}  "
-              f"v_ego=[{v_ego[0]:+.2f}, {v_ego[1]:+.2f}, {v_ego[2]:+.2f}]")
-
-        # Prepare [x, y, z, rcs] for accumulation
-        if len(static_points) > 0:
-            pts_xyz_rcs = np.column_stack([
-                static_points[:, :3],
-                static_points[:, 4],   # RCS -> intensity
-            ])
-        else:
-            pts_xyz_rcs = np.empty((0, 4))
-
-        # --- Step 3: Multi-frame accumulation ---
-        new_buffer = deque(maxlen=n_accumulate)
-        for old_pts, _, old_v, old_ts in frame_buffer:
-            new_dt = current_ts_sec - old_ts
-            new_buffer.append((old_pts, new_dt, old_v, old_ts))
-        new_buffer.append((pts_xyz_rcs, 0.0, v_ego, current_ts_sec))
-        frame_buffer = new_buffer
-
-        # Accumulate and downsample
-        accum_input = [(pts, dt, vel) for pts, dt, vel, _ in frame_buffer]
-        accumulated = accumulate_frames(accum_input, voxel_size)
-
-        # Save accumulated PCD
-        if len(accumulated) > 0:
-            out_path = os.path.join(output_dir, f"{basename}.pcd")
-            write_pcd_xyzi(out_path, accumulated)
-
-    ego_vel_file.close()
-    print(f"\nDone. Saved {len(pcd_files)} preprocessed PCD files to {output_dir}")
-    print(f"Ego velocity log: {ego_vel_csv_path}")
-
+    # Stage 2: IMU extraction from bag
+    if do_imu or imu_only:
+        extract_imu(params, track)
+    else:
+        print("[INFO] Skipping IMU extraction (use --extract-imu or --imu-only to enable)")
 
 if __name__ == '__main__':
     main()
