@@ -12,8 +12,8 @@ services:
     volumes:
       - /tmp/.X11-unix:/tmp/.X11-unix:rw
       # - ~/catkin_ws:/root/catkin_ws
-      - ./lab5/src/fusion:/root/catkin_ws/src/fusion
-      - ./lab5/data:/root/catkin_ws/data
+      - ./lidar-slam:/root/catkin_ws/src/lidar-slam
+      - ./sdc_3dgs_reconstruction:/root/catkin_ws/src/sdc_3dgs_reconstruction
     ports:
       - "2233:22"
     user: root
