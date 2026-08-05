@@ -1,0 +1,10 @@
+seq*/
+public_dev/
+test_input/
+*.mp4
+__pycache__/
+.vscode/
+CLAUDE.md
+output/
+outputs/
+*.csv
