@@ -1,0 +1,7 @@
+mid2dataset/
+.vscode/
+slam_env/
+__pycache__/
+io.py
+keyframe.py
+posegraph.py
